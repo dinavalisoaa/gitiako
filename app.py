@@ -1,4 +1,4 @@
-import datetime, json, os, re, shutil, subprocess, sys, tempfile, threading, urllib.parse, webbrowser, tkinter as tk
+import base64, datetime, json, os, re, shutil, subprocess, sys, tempfile, threading, urllib.parse, webbrowser, tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -15,8 +15,8 @@ last = {"k": None}  # dernier fichier affiché dans l'aperçu
 HIST = {"all": []}  # commits chargés (hash, titre, auteur, date) ; la liste affichée en est un filtre
 
 
-def run(cmd, **kw):
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # échoue au lieu de bloquer sur un prompt
+def run(cmd, env=None, **kw):
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **profile_env(), **(env or {})}  # échoue au lieu de bloquer sur un prompt
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
                        stdin=subprocess.DEVNULL, creationflags=NOWIN, **kw)  # stdin explicite : requis dans un exe sans console
     if r.returncode:
@@ -24,8 +24,12 @@ def run(cmd, **kw):
     return r.stdout
 
 
+NET = ("push", "pull", "fetch")
+
+
 def git(*a, r=None):  # r : un autre dépôt que le courant (merge requests multi-dépôts)
-    return run(["git", "-C", r or repo, *a])
+    target = r or repo
+    return run(["git", "-C", target, *a], env=git_auth_env(target) if a and a[0] in NET else None)
 
 
 # ---------- IA : un processus claude déjà démarré (l'init de ~8 s se fait pendant que tu coches) ----------
@@ -743,21 +747,76 @@ def mr_url(host, path, src, tgt, title, body):  # page de création pré-remplie
     return f"https://{host}/{path}/-/merge_requests/new?{q}"
 
 
+PROFILES = {"list": [], "active": None}  # utilisateurs : identité git + tokens par hôte ; un seul est actif
+
+
+def load_profiles():
+    st = load_settings()
+    lst = st.get("profiles") or [{"id": "p1", "name": "Moi", "git_name": "", "email": "", "tokens": st.get("tokens", {})}]  # reprend les tokens d'avant
+    PROFILES["list"] = lst
+    PROFILES["active"] = st.get("active") if any(x["id"] == st.get("active") for x in lst) else lst[0]["id"]
+
+
+def save_profiles():
+    save_settings(profiles=PROFILES["list"], active=PROFILES["active"], tokens={})
+
+
+def me():
+    return next((x for x in PROFILES["list"] if x["id"] == PROFILES["active"]), None) or {"name": "", "tokens": {}}
+
+
+def profile_env():  # auteur et committer des commits : l'utilisateur actif (vide = config git du dépôt)
+    p, env = me(), {}
+    if p.get("git_name"):
+        env.update(GIT_AUTHOR_NAME=p["git_name"], GIT_COMMITTER_NAME=p["git_name"])
+    if p.get("email"):
+        env.update(GIT_AUTHOR_EMAIL=p["email"], GIT_COMMITTER_EMAIL=p["email"])
+    return env
+
+
 def gitlab_token(host):
-    return load_settings().get("tokens", {}).get(host)
+    return me().get("tokens", {}).get(host)
 
 
 def save_token(host, token):
-    tokens = load_settings().get("tokens", {})
+    tokens = me().setdefault("tokens", {})
     if token:
         tokens[host] = token
     else:
         tokens.pop(host, None)
-    save_settings(tokens=tokens)
+    save_profiles()
+
+
+def git_auth_env(target):  # push/pull/fetch en https avec le token de l'utilisateur actif (via l'environnement, pas les arguments)
+    try:
+        host = remote_web(target)[0]
+    except RuntimeError:
+        return None
+    tok = gitlab_token(host)
+    if not tok:
+        return None
+    basic = base64.b64encode(f"{'x-access-token' if host == 'github.com' else 'oauth2'}:{tok}".encode()).decode()
+    return {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "",
+            "GIT_CONFIG_KEY_1": f"http.https://{host}/.extraheader", "GIT_CONFIG_VALUE_1": f"Authorization: Basic {basic}"}
+
+
+def cli_env(host):  # gh / glab agissent en tant que l'utilisateur actif
+    tok = gitlab_token(host) if host else None
+    if not tok:
+        return None
+    return {"GH_TOKEN": tok} if host == "github.com" else {"GITLAB_TOKEN": tok, "GITLAB_HOST": host}
+
+
+def ci_env():
+    try:
+        return cli_env(remote_web()[0])
+    except RuntimeError:
+        return None
 
 
 def ask_token(host):  # à appeler depuis la fenêtre principale ; le token est saisi dans l'app, jamais affiché
-    tok = simpledialog.askstring("Token GitLab", f"Token d'accès personnel pour {host} (scope api).\nGitLab → ton avatar → Préférences → Jetons d'accès.\n"
+    scope = "repo" if host == "github.com" else "api"
+    tok = simpledialog.askstring(f"Token — {me()['name']}", f"Token d'accès personnel de {me()['name']} pour {host} (scope {scope}).\n"
                                  "Il est gardé dans settings.json, lisible par toi seul.", show="•", parent=root)
     if tok and tok.strip():
         save_token(host, tok.strip())
@@ -799,10 +858,10 @@ def create_mr(src, tgt, title, body, r=None):  # création directe : gh (GitHub)
         cli = find_tool("gh")
         if not cli:
             raise RuntimeError("Installe gh (brew install gh) puis gh auth login.")
-        out = run([cli, "pr", "create", "--head", src, "--base", tgt, "--title", title, "--body", body], cwd=r or repo)
+        out = run([cli, "pr", "create", "--head", src, "--base", tgt, "--title", title, "--body", body], cwd=r or repo, env=cli_env(host))
     elif find_tool("glab"):
         out = run([find_tool("glab"), "mr", "create", "--source-branch", src, "--target-branch", tgt, "--title", title,
-                   "--description", body, "--yes"], cwd=r or repo)
+                   "--description", body, "--yes"], cwd=r or repo, env=cli_env(host))
     else:
         out = gl_call(host, path, "projects/:id/merge_requests", [("source_branch", src), ("target_branch", tgt), ("title", title), ("description", body)])
         try:
@@ -1041,7 +1100,7 @@ def ci_tool():  # (genre, outil) ; GitLab sans glab → outil None : API avec to
 
 def gl_get(cli, endpoint):  # glab si présent, sinon l'API avec le token enregistré
     if cli:
-        return run([cli, "api", endpoint], cwd=repo)
+        return run([cli, "api", endpoint], cwd=repo, env=ci_env())
     host, path = remote_web()
     return gl_call(host, path, endpoint)
 
@@ -1050,7 +1109,7 @@ def fetch_pipelines():
     kind, cli = ci_tool()
     if kind == "github":
         rows = json.loads(run([cli, "run", "list", "-L", "30", "--json",
-                               "databaseId,status,conclusion,headBranch,displayTitle,workflowName,createdAt,url"], cwd=repo))
+                               "databaseId,status,conclusion,headBranch,displayTitle,workflowName,createdAt,url"], cwd=repo, env=ci_env()))
         return [dict(id=r["databaseId"], status=gh_status(r), ref=r["headBranch"], info=f'{r["workflowName"]} · {r["displayTitle"]}',
                      when=r["createdAt"], url=r["url"]) for r in rows]
     rows = json.loads(gl_get(cli, "projects/:id/pipelines?per_page=30"))
@@ -1061,7 +1120,7 @@ def fetch_pipelines():
 def fetch_jobs(p):
     kind, cli = ci_tool()
     if kind == "github":
-        data = json.loads(run([cli, "run", "view", str(p["id"]), "--json", "jobs"], cwd=repo))
+        data = json.loads(run([cli, "run", "view", str(p["id"]), "--json", "jobs"], cwd=repo, env=ci_env()))
         return [dict(id=j["databaseId"], name=j["name"], stage="", status=gh_status(j),
                      dur=secs(j.get("startedAt"), j.get("completedAt")), url=j["url"]) for j in data["jobs"]]
     rows = json.loads(gl_get(cli, f"projects/:id/pipelines/{p['id']}/jobs?per_page=100"))
@@ -1072,7 +1131,7 @@ def fetch_jobs(p):
 def fetch_log(j):  # fin du log, sans codes couleur
     kind, cli = ci_tool()
     if kind == "github":
-        out = run([cli, "run", "view", "--job", str(j["id"]), "--log"], cwd=repo)
+        out = run([cli, "run", "view", "--job", str(j["id"]), "--log"], cwd=repo, env=ci_env())
         out = "\n".join(re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ?", "", l.split("\t", 2)[-1]) for l in out.splitlines())
     else:
         out = gl_get(cli, f"projects/:id/jobs/{j['id']}/trace")
@@ -1177,8 +1236,6 @@ def set_token():  # saisie (ou remplacement) du token GitLab de l'hôte du dép�
         host = remote_web()[0]
     except RuntimeError as e:
         return status.set(str(e))
-    if host == "github.com":
-        return messagebox.showinfo("Token", "GitHub passe par gh : lance `gh auth login` dans un terminal.")
     if ask_token(host):
         refresh_pipes()
 
@@ -1196,6 +1253,120 @@ def open_web(which=None):  # "p"/"j" : le pipeline / le job choisi ; sinon (bout
             return status.set(str(e))
         url = f"https://github.com/{path}/actions" if host == "github.com" else f"https://{host}/{path}/-/pipelines"
     webbrowser.open(url)
+
+
+# ---------- utilisateurs (profils) ----------
+def refresh_users():
+    names_ = [x["name"] for x in PROFILES["list"]]
+    ucombo["values"] = names_
+    ucombo.current(next(i for i, x in enumerate(PROFILES["list"]) if x["id"] == PROFILES["active"]))
+    uav.config(image=avatar(me()["name"]))
+    p = me()
+    ident = " ".join(x for x in (p.get("git_name"), f"<{p['email']}>" if p.get("email") else "") if x)
+    as_lbl.set(f"Commit en tant que {ident}" if ident else "Commit avec la config git du dépôt")
+
+
+def switch_user(_=None):
+    PROFILES["active"] = PROFILES["list"][ucombo.current()]["id"]
+    save_profiles()
+    refresh_users()
+    PIPE["repo"] = None  # les pipelines se rechargent avec le token du nouvel utilisateur
+    if pipe_frame.winfo_ismapped():
+        refresh_pipes()
+    status.set(f"Utilisateur : {me()['name']}")
+
+
+def git_identity():  # valeurs de départ d'un nouveau profil : la config git globale
+    out = []
+    for key in ("user.name", "user.email"):
+        try:
+            out.append(run(["git", "config", "--global", key]).strip())
+        except (RuntimeError, OSError):
+            out.append("")
+    return out
+
+
+def profile_dialog(edit):
+    cur = me() if edit else None
+    gname, gmail = (cur.get("git_name", ""), cur.get("email", "")) if cur else git_identity()
+    tokens = dict(cur.get("tokens", {})) if cur else {}
+    dlg = tk.Toplevel(root, bg=BG)
+    dlg.title("Modifier l'utilisateur" if edit else "Nouvel utilisateur")
+    dlg.transient(root)
+    dlg.resizable(False, False)
+    box_ = tk.Frame(dlg, bg=BG)
+    box_.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
+    ents = {}
+    for key, cap, val in (("name", "Nom du profil (ce que tu vois dans la liste)", cur["name"] if cur else ""),
+                          ("git_name", "Nom des commits (git user.name)", gname), ("email", "Email des commits (git user.email)", gmail)):
+        label(box_, text=cap, fg=MUTED).pack(fill=tk.X)
+        ents[key] = field(tk.Entry, box_, width=44)
+        ents[key].insert(0, val)
+        ents[key].pack(fill=tk.X, pady=(3, 8), ipady=5)
+    label(box_, text="Tokens (hôte) — GitLab : scope api · GitHub : scope repo", fg=MUTED).pack(fill=tk.X)
+    tbox = tk.Frame(box_, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+    tbox.pack(fill=tk.X, pady=(3, 6))
+    lb = tk.Listbox(tbox, height=4, activestyle="none", exportselection=False, bg=PANEL, fg=FG, font=FONT, relief=tk.FLAT, bd=0,
+                    highlightthickness=0, selectbackground=SEL, selectforeground=FG)
+    lb.pack(fill=tk.X)
+
+    def fill_tokens():
+        lb.delete(0, tk.END)
+        lb.insert(tk.END, *[f"{h}   ••••••••" for h in tokens])
+
+    def add_token():
+        host = (simpledialog.askstring("Hôte", "Hôte du token (ex. gitlab.ibonia.com ou github.com) :", parent=dlg) or "").strip()
+        tok = simpledialog.askstring("Token", f"Token pour {host} :", show="•", parent=dlg) if host else None
+        if host and tok and tok.strip():
+            tokens[host] = tok.strip()
+            fill_tokens()
+
+    def drop_token():
+        if lb.curselection():
+            tokens.pop(list(tokens)[lb.curselection()[0]], None)
+            fill_tokens()
+    fill_tokens()
+    trow = tk.Frame(box_, bg=BG)
+    trow.pack(fill=tk.X, pady=(0, 12))
+    btn(trow, "Ajouter un token…", add_token, padx=10, pady=3).pack(side=tk.LEFT)
+    btn(trow, "Retirer", drop_token, padx=10, pady=3).pack(side=tk.LEFT, padx=4)
+
+    def save():
+        name = ents["name"].get().strip()
+        if not name:
+            return messagebox.showwarning("Utilisateur", "Il faut un nom de profil.", parent=dlg)
+        if any(x["name"] == name and x is not cur for x in PROFILES["list"]):
+            return messagebox.showwarning("Utilisateur", "Ce nom existe déjà.", parent=dlg)
+        data = {"name": name, "git_name": ents["git_name"].get().strip(), "email": ents["email"].get().strip(), "tokens": tokens}
+        if cur:
+            cur.update(data)
+        else:
+            PROFILES["list"].append({"id": f"p{int(datetime.datetime.now().timestamp() * 1000)}", **data})
+            PROFILES["active"] = PROFILES["list"][-1]["id"]  # le nouvel utilisateur devient actif
+        save_profiles()
+        dlg.destroy()
+        refresh_users()
+        switch_user() if not edit else None
+    brow = tk.Frame(box_, bg=BG)
+    brow.pack(fill=tk.X)
+    btn(brow, "Annuler", dlg.destroy, padx=14, pady=7).pack(side=tk.RIGHT, padx=(6, 0))
+    btn(brow, "Enregistrer", save, BLUE, "white", FONT_B, padx=16, pady=7).pack(side=tk.RIGHT)
+    try:
+        dlg.wait_visibility()
+        dlg.grab_set()
+    except tk.TclError:
+        pass
+
+
+def delete_user():
+    if len(PROFILES["list"]) < 2:
+        return messagebox.showinfo("Utilisateur", "Il faut garder au moins un utilisateur.")
+    if messagebox.askyesno("Supprimer l'utilisateur", f"Supprimer « {me()['name']} » et ses tokens ?"):
+        PROFILES["list"].remove(me())
+        PROFILES["active"] = PROFILES["list"][0]["id"]
+        save_profiles()
+        refresh_users()
+        switch_user()
 
 
 # ---------- repos mémorisés ----------
@@ -1545,7 +1716,7 @@ st.configure("Horizontal.TProgressbar", troughcolor=BORDER, background=BLUE, bor
 root.option_add("*TCombobox*Listbox.background", FIELD)
 root.option_add("*TCombobox*Listbox.foreground", FG)
 root.option_add("*TCombobox*Listbox.selectBackground", SEL)
-count_lbl, status, diff_dir, diff_name, diff_add, diff_del, files_lbl, h_title, h_author, h_sha, h_add, h_del = (tk.StringVar() for _ in range(12))
+as_lbl, count_lbl, status, diff_dir, diff_name, diff_add, diff_del, files_lbl, h_title, h_author, h_sha, h_add, h_del = (tk.StringVar() for _ in range(13))
 
 
 def box_img(kind):  # case à cocher façon GitHub Desktop : carré vide / bleu + coche / bleu + tiret
@@ -1592,6 +1763,15 @@ bcombo = ttk.Combobox(r2, state="readonly", font=FONT_B, width=26)
 bcombo.pack(side=tk.LEFT)
 bcombo.bind("<<ComboboxSelected>>", switch_branch)
 btn(r2, "＋", new_branch, padx=8, pady=3).pack(side=tk.LEFT, padx=(6, 0))
+r_u = section("Utilisateur")
+uav = tk.Label(r_u, bg=TOP)
+uav.pack(side=tk.LEFT, padx=(0, 6))
+ucombo = ttk.Combobox(r_u, state="readonly", font=FONT_B, width=14)
+ucombo.pack(side=tk.LEFT)
+ucombo.bind("<<ComboboxSelected>>", switch_user)
+btn(r_u, "＋", lambda: profile_dialog(False), padx=8, pady=3).pack(side=tk.LEFT, padx=(6, 0))
+btn(r_u, "✎", lambda: profile_dialog(True), padx=8, pady=3).pack(side=tk.LEFT, padx=(4, 0))
+btn(r_u, "✕", delete_user, padx=8, pady=3).pack(side=tk.LEFT, padx=(4, 0))
 r3 = tk.Frame(tb, bg=TOP)
 r3.pack(side=tk.RIGHT, padx=14, pady=12)
 tb_push = btn(r3, "Push", lambda: sync("Push", "push", "-u", "origin", "HEAD"), padx=12, pady=5)
@@ -1684,6 +1864,7 @@ summary.pack(fill=tk.X, pady=(3, 8), ipady=6)
 label(form, text="Description", fg=MUTED).pack(fill=tk.X)
 desc = field(tk.Text, form, height=4, wrap=tk.WORD, padx=6, pady=6)
 desc.pack(fill=tk.X, pady=(3, 8))
+label(form, textvariable=as_lbl, fg=MUTED, font=SMALL).pack(fill=tk.X, pady=(0, 6))
 crow = tk.Frame(form, bg=BG)
 crow.pack(fill=tk.X)
 commit_btn = btn(crow, "", lambda: commit(False), BLUE, "white", FONT_B, pady=8)
@@ -1790,6 +1971,8 @@ try:
         repos = [p for p in json.load(fh) if os.path.isdir(p)]  # oublie les dossiers disparus
 except (OSError, ValueError, TypeError):
     repos = []
+load_profiles()
+refresh_users()
 combo["values"] = names()
 start = sys.argv[1] if len(sys.argv) > 1 else (repos[0] if repos else "")
 set_repo(start) if start else load()
