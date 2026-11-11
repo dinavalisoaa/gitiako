@@ -1,6 +1,6 @@
 import base64, datetime, json, os, re, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, webbrowser, tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 MAX_DIFF, MAX_FILE, MAX_LINES = 40000, 4000, 3000  # MAX_DIFF/MAX_FILE : taille envoyée à l'IA ; MAX_LINES : aperçu
 CONF_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "CommitMsg")  # hors de l'exe
@@ -301,8 +301,59 @@ def load():
                 i += 1
             files.append((xy, f, ps))
         meta()  # rien n'est coché par défaut (ni au chargement, ni après un commit)
+    refresh_stash()
     root.title(f"Commit — {repo}" if repo else "Commit")
     render()
+
+
+SYNC = {"run": lambda: None}  # action du bouton de synchro : fetch, pull, push ou publication selon l'état
+STASH = "CommitMsg!!"  # marque les stashs « laissés sur la branche » (suivie du nom de la branche)
+STASHED = {"ref": None}
+
+
+def fetched_ago():
+    try:
+        s = time.time() - os.path.getmtime(os.path.join(repo, git("rev-parse", "--git-dir").strip(), "FETCH_HEAD"))
+    except (OSError, RuntimeError):
+        return "jamais"
+    return "à l'instant" if s < 60 else f"il y a {int(s // 60)} min" if s < 3600 else f"il y a {int(s // 3600)} h" if s < 86400 else f"il y a {int(s // 86400)} j"
+
+
+def stash_of(name):  # le stash le plus récent laissé sur cette branche (stash@{n}), ou None
+    try:
+        for l in git("stash", "list", "--format=%gd%x1f%gs").splitlines():
+            ref, _, msg = l.partition("\x1f")
+            if msg.endswith(STASH + name):
+                return ref
+    except RuntimeError:
+        pass
+    return None
+
+
+def refresh_stash():
+    STASHED["ref"] = stash_of(branch) if repo and branch else None
+    if STASHED["ref"]:
+        stash_bar.pack(fill=tk.X, padx=12, pady=(0, 8), before=form)
+    else:
+        stash_bar.pack_forget()
+
+
+def stash_view():
+    try:
+        show_diff(git("stash", "show", "-p", STASHED["ref"]), "Modifications mises de côté")
+    except RuntimeError as e:
+        messagebox.showerror("Erreur", str(e))
+
+
+def stash_pop():
+    ref = STASHED["ref"]
+    bg(lambda: git("stash", "pop", ref), lambda _: (load(), status.set("Modifications restaurées")), "Restauration")
+
+
+def stash_drop():
+    ref = STASHED["ref"]
+    if messagebox.askyesno("Supprimer", f"Supprimer définitivement les modifications mises de côté sur {branch} ?"):
+        bg(lambda: git("stash", "drop", ref), lambda _: (load(), status.set("Modifications mises de côté supprimées")), "Suppression")
 
 
 def meta():  # branches, avance/retard sur le distant, historique
@@ -316,8 +367,20 @@ def meta():  # branches, avance/retard sur le distant, historique
         behind, ahead = map(int, git("rev-list", "--left-right", "--count", "@{u}...HEAD").split())
     except (RuntimeError, ValueError):  # pas d'upstream
         ahead = behind = None
-    tb_push.config(text="Push" + (f" ↑{ahead}" if ahead else ""))
-    tb_pull.config(text="Pull" + (f" ↓{behind}" if behind else ""))
+    n = " ".join(x for x in (f"↓{behind}" if behind else "", f"↑{ahead}" if ahead else "") if x)
+    sub = (n + " · " if n else "") + "dernier fetch " + fetched_ago()
+    if ahead is None:  # pas encore sur le distant
+        SYNC["run"] = lambda: sync("Publication", "push", "-u", "origin", "HEAD")
+        tb_sync.config(icon="↑", text="Publier la branche", sub="Envoie la branche sur origin")
+    elif behind:
+        SYNC["run"] = lambda: sync("Pull", "pull", "--ff-only")
+        tb_sync.config(icon="↓", text="Pull origin", sub=sub)
+    elif ahead:
+        SYNC["run"] = lambda: sync("Push", "push", "-u", "origin", "HEAD")
+        tb_sync.config(icon="↑", text="Push origin", sub=sub)
+    else:
+        SYNC["run"] = lambda: sync("Fetch", "fetch", "--prune")
+        tb_sync.config(icon="↻", text="Fetch origin", sub=sub[0].upper() + sub[1:])
     try:
         HIST["all"] = [tuple(l.split("\x1f")) for l in git("log", "-300", "--pretty=format:%h%x1f%s%x1f%an%x1f%ar").splitlines()]
     except RuntimeError:  # aucun commit
@@ -686,14 +749,46 @@ def commit(push):
 
 
 # ---------- branches et synchro ----------
-def switch_branch(_=None):
-    name = bcombo.get()
-    if name and name != branch:
-        bg(lambda: git("checkout", name), lambda _: (load(), status.set(f"Branche : {name}")), f"Checkout {name}")
+def switch_branch(name):  # avec des modifications en cours : on demande quoi en faire, comme GitHub Desktop
+    if not name or name == branch:
+        return
+    try:
+        dirty = bool(git("status", "--porcelain").strip())
+    except RuntimeError:
+        dirty = False
+    mode = ask_switch(name) if dirty else "clean"
+    if not mode:
+        return
+    old = branch
+
+    def job():
+        count = lambda: len(git("stash", "list").splitlines())
+        n0 = count()
+        if mode != "clean":
+            git("stash", "push", "-u", "-m", STASH + old if mode == "leave" else f"CommitMsg : emporté de {old} vers {name}")
+        stashed = count() > n0  # rien à mettre de côté : surtout ne pas dépiler un autre stash
+        try:
+            git("checkout", name)
+        except RuntimeError:
+            if stashed:
+                git("stash", "pop")  # on n'a pas bougé : les modifications reviennent
+            raise
+        if stashed and mode == "bring":
+            try:
+                git("stash", "pop")
+            except RuntimeError as e:
+                return f"Les modifications n'ont pas pu être réappliquées sur {name}. Elles restent dans le stash (git stash list).\n\n{e}"
+
+    def then(warn):
+        load()
+        status.set(f"Branche : {name}")
+        if warn:
+            messagebox.showwarning("Changer de branche", warn)
+    bg(job, then, f"Checkout {name}")
 
 
 def new_branch():
-    name = (simpledialog.askstring("Nouvelle branche", f"Nom (créée depuis {branch}) :", parent=root) or "").strip()
+    name = (ask_string("Nouvelle branche", f"Nom (créée depuis {branch}) :", parent=root) or "").strip()
     if name:
         bg(lambda: git("checkout", "-b", name), lambda _: (load(), status.set(f"Branche créée : {name}")), f"Création de {name}")
 
@@ -843,7 +938,7 @@ def ci_env():
 
 def ask_token(host):  # à appeler depuis la fenêtre principale ; le token est saisi dans l'app, jamais affiché
     scope = "repo" if host == "github.com" else "api"
-    tok = simpledialog.askstring(f"Token — {me()['name']}", f"Token d'accès personnel de {me()['name']} pour {host} (scope {scope}).\n"
+    tok = ask_string(f"Token — {me()['name']}", f"Token d'accès personnel de {me()['name']} pour {host} (scope {scope}).\n"
                                  "Il est gardé dans settings.json, lisible par toi seul.", show="•", parent=root)
     if tok and tok.strip():
         save_token(host, tok.strip())
@@ -1408,8 +1503,8 @@ def profile_dialog(edit):
         lb.insert(tk.END, *[f"{h}   ••••••••" for h in tokens])
 
     def add_token():
-        host = (simpledialog.askstring("Hôte", "Hôte du token (ex. gitlab.ibonia.com ou github.com) :", parent=dlg) or "").strip()
-        tok = simpledialog.askstring("Token", f"Token pour {host} :", show="•", parent=dlg) if host else None
+        host = (ask_string("Hôte", "Hôte du token (ex. gitlab.ibonia.com ou github.com) :", parent=dlg) or "").strip()
+        tok = ask_string("Token", f"Token pour {host} :", show="•", parent=dlg) if host else None
         if host and tok and tok.strip():
             tokens[host] = tok.strip()
             fill_tokens()
@@ -1523,9 +1618,9 @@ def quit_app():
 
 
 # ---------- interface ----------
-BG, TOP, PANEL, FIELD, BORDER = "#161b22", "#1c2128", "#0d1117", "#0d1117", "#30363d"  # volet / barre / zones creuses
-FG, MUTED, SEL = "#e6edf3", "#7d8590", "#1f3a5f"
-BLUE, GREEN, PURPLE, GREY, RED, AMBER = "#2f81f7", "#2ea043", "#8957e5", "#2b313a", "#f85149", "#d29922"
+BG, TOP, PANEL, FIELD, BORDER = "#24292e", "#1f2428", "#1b1f23", "#1b1f23", "#141414"  # volet / barre / zones creuses : le thème sombre de GitHub Desktop
+FG, MUTED, SEL, CARD, THUMB = "#e1e4e8", "#959da5", "#0a56ad", "#2f363d", "#444d56"
+BLUE, GREEN, PURPLE, GREY, RED, AMBER = "#2f81f7", "#2ea043", "#8957e5", "#363d46", "#f85149", "#d29922"
 MAC = sys.platform == "darwin"  # polices du système, comme GitHub Desktop : San Francisco + Menlo sur Mac, Segoe UI + Consolas sur Windows
 SANS, MONOF = (".AppleSystemUIFont", "Menlo") if MAC else ("Segoe UI", "Consolas")
 SZ = 11 if MAC else 9
@@ -1611,6 +1706,142 @@ def make_tree(parent, columns, show="headings", **kw):  # Treeview + barre de d�
     s.pack(side=tk.RIGHT, fill=tk.Y)
     t.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     return box, t
+
+
+class ToolBtn(tk.Frame):  # bouton de barre façon GitHub Desktop : icône, deux lignes de texte, ▾ éventuel
+    def __init__(self, parent, icon, small, main, cmd, width=230, arrow=False, small_first=True):
+        super().__init__(parent, bg=TOP, width=width, height=50, cursor="hand2")
+        self.pack_propagate(False)
+        self.cmd, self.on, self.base = cmd, True, TOP
+        tk.Frame(self, bg=BORDER, width=1).pack(side=tk.RIGHT, fill=tk.Y)
+        self.ic = tk.Label(self, text=icon, bg=TOP, fg=MUTED, font=(SANS, SZ + 4))
+        self.ic.pack(side=tk.LEFT, padx=(12, 8))
+        self.parts = [self, self.ic]
+        if arrow:
+            ar = tk.Label(self, text="▾", bg=TOP, fg=MUTED, font=FONT)
+            ar.pack(side=tk.RIGHT, padx=(4, 10))
+            self.parts.append(ar)
+        col = tk.Frame(self, bg=TOP)
+        col.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.small = tk.Label(col, text=small, bg=TOP, fg=MUTED, font=SMALL, anchor="w")
+        self.main = tk.Label(col, text=main, bg=TOP, fg=FG, font=FONT_B, anchor="w")
+        for w in (self.small, self.main) if small_first else (self.main, self.small):
+            w.pack(fill=tk.X)
+        self.parts += [col, self.small, self.main]
+        for w in self.parts:
+            w.bind("<Button-1>", self.click)
+            w.bind("<Enter>", lambda e: self.paint(lighten(self.base)) if self.on else None)
+            w.bind("<Leave>", lambda e: self.paint(self.base))
+
+    def paint(self, c):
+        for w in self.parts:
+            tk.Frame.config(w, bg=c) if w is self else w.config(bg=c)
+
+    def click(self, _):
+        if self.on:
+            self.cmd()
+
+    def config(self, cnf=None, **kw):
+        kw = {**(cnf or {}), **kw}
+        for k, w in (("text", self.main), ("sub", self.small), ("icon", self.ic)):
+            if k in kw:
+                w.config(text=kw.pop(k))
+        if "state" in kw:
+            self.on = kw.pop("state") != tk.DISABLED
+            self.main.config(fg=FG if self.on else MUTED)
+            tk.Frame.config(self, cursor="hand2" if self.on else "arrow")
+        if kw:
+            tk.Frame.config(self, **kw)
+    configure = config
+
+
+class DropBtn(ToolBtn):  # + panneau filtrable qui se déroule sous le bouton, dans la fenêtre ; même API qu'un Combobox (values, get, set, current)
+    opened = None
+
+    def __init__(self, parent, icon, caption, on_pick, actions=(), width=250):
+        super().__init__(parent, icon, caption, "—", self.toggle, width, arrow=True)
+        self.values, self.val, self.pick, self.actions, self.panel, self.shown = [], "", on_pick, actions, None, []
+
+    def __setitem__(self, k, v):
+        if k != "values":
+            return super().__setitem__(k, v)
+        self.values = list(v)
+        if self.panel:
+            self.fill()
+
+    def get(self):
+        return self.val
+
+    def set(self, v):
+        self.val = v
+        self.config(text=v or "—")
+
+    def current(self, i=None):
+        if i is None:
+            return self.values.index(self.val) if self.val in self.values else -1
+        self.set(self.values[i])
+
+    def toggle(self):
+        self.close() if self.panel else self.open()
+
+    def open(self):
+        if DropBtn.opened:
+            DropBtn.opened.close()
+        DropBtn.opened, top = self, self.winfo_toplevel()
+        x, y = self.winfo_rootx() - top.winfo_rootx(), self.winfo_rooty() - top.winfo_rooty() + self.winfo_height()
+        p = self.panel = tk.Frame(top, bg=BG, highlightthickness=1, highlightbackground=BORDER)
+        p.place(x=x, y=y, width=max(self.winfo_width(), 340), height=max(200, top.winfo_height() - y))
+        p.lift()
+        head = tk.Frame(p, bg=BG)
+        head.pack(fill=tk.X, padx=10, pady=10)
+        for text, cmd in self.actions[:1]:
+            btn(head, text, lambda c=cmd: (self.close(), c()), padx=10, pady=4).pack(side=tk.RIGHT, padx=(6, 0))
+        self.q = tk.StringVar()
+        ent = field(tk.Entry, head, textvariable=self.q)
+        ent.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        if self.actions[1:]:
+            foot = tk.Frame(p, bg=BG)
+            foot.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
+            for text, cmd in self.actions[1:]:
+                btn(foot, text, lambda c=cmd: (self.close(), c()), padx=10, pady=4).pack(side=tk.LEFT, padx=(0, 6))
+        self.lb = tk.Listbox(p, activestyle="none", exportselection=False, bg=BG, fg=FG, font=(SANS, SZ + 1), relief=tk.FLAT, bd=0,
+                             highlightthickness=0, selectbackground=SEL, selectforeground="white", cursor="hand2")
+        self.lb.pack(fill=tk.BOTH, expand=True, padx=4)
+        self.q.trace_add("write", lambda *_: self.fill())
+        self.lb.bind("<ButtonRelease-1>", lambda e: self.choose(self.lb.nearest(e.y)))
+        self.lb.bind("<Return>", lambda e: self.choose(self.lb.curselection()[0]) if self.lb.curselection() else None)
+        ent.bind("<Return>", lambda e: self.choose(0))  # Entrée : le premier qui correspond
+        ent.bind("<Down>", lambda e: (self.lb.focus_set(), self.lb.selection_set(0) if self.shown else None, "break")[-1])
+        for w in (ent, self.lb):
+            w.bind("<Escape>", lambda e: self.close())
+        self.fill()
+        ent.focus_set()
+        self.base = BG
+        self.paint(BG)
+
+    def fill(self):
+        q = self.q.get().strip().lower()
+        self.shown = [v for v in self.values if q in v.lower()]
+        self.lb.delete(0, tk.END)
+        self.lb.insert(tk.END, *[("✓  " if v == self.val else "     ") + v for v in self.shown])
+
+    def choose(self, i):
+        if 0 <= i < len(self.shown):
+            v = self.shown[i]
+            self.close()
+            self.pick(self.values.index(v), v)
+
+    def close(self):
+        if self.panel:
+            self.panel.destroy()
+        self.panel, DropBtn.opened, self.base = None, None, TOP
+        self.paint(TOP)
+
+    @staticmethod
+    def outside(e):  # clic ailleurs dans la fenêtre : le panneau se referme
+        o, w = DropBtn.opened, str(e.widget)
+        if o and o.panel and not (w.startswith(str(o.panel)) or w == str(o) or w.startswith(str(o) + ".")):
+            o.close()
 
 
 class BranchBox(tk.Frame):  # sélecteur de branche filtrable : valeur choisie, champ de recherche, liste
@@ -1792,11 +2023,117 @@ def file_row(code, path):  # dossier estompé + nom en clair, icône d'état à 
     return build
 
 
+def ask_string(title, prompt, show=None, parent=None):  # remplace simpledialog, qui plante sous Tk 9 / macOS
+    parent = parent or root
+    dlg = tk.Toplevel(parent, bg=BG)
+    dlg.title(title)
+    dlg.transient(parent)
+    dlg.resizable(False, False)
+    out = {"v": None}
+    label(dlg, text=prompt, justify=tk.LEFT, wraplength=420, padx=18).pack(fill=tk.X, pady=(16, 8))
+    ent = field(tk.Entry, dlg, width=46, show=show or "")
+    ent.pack(fill=tk.X, padx=18, ipady=5)
+    row = tk.Frame(dlg, bg=BG)
+    row.pack(fill=tk.X, padx=18, pady=14)
+
+    def ok():
+        out["v"] = ent.get()
+        dlg.destroy()
+    btn(row, "Annuler", dlg.destroy, padx=14, pady=6).pack(side=tk.RIGHT, padx=(6, 0))
+    btn(row, "OK", ok, BLUE, "white", FONT_B, padx=18, pady=6).pack(side=tk.RIGHT)
+    ent.bind("<Return>", lambda e: ok())
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+    ent.focus_set()
+    try:
+        dlg.wait_visibility()
+        dlg.grab_set()
+    except tk.TclError:
+        pass
+    parent.wait_window(dlg)
+    if isinstance(parent, tk.Toplevel) and parent.winfo_exists():  # rend la main à la fenêtre qui avait le focus modal
+        try:
+            parent.grab_set()
+        except tk.TclError:
+            pass
+    return out["v"]
+
+
+def ask_switch(name):  # le choix de GitHub Desktop quand la branche a des modifications : les laisser (stash) ou les emporter
+    dlg = tk.Toplevel(root, bg=BG)
+    dlg.title("Changer de branche")
+    dlg.transient(root)
+    dlg.resizable(False, False)
+    out, mode, cards = {"v": None}, tk.StringVar(value="leave"), {}
+    label(dlg, text="Changer de branche", font=BIG, padx=20, pady=14).pack(fill=tk.X)
+    tk.Frame(dlg, bg=BORDER, height=1).pack(fill=tk.X)
+    label(dlg, text="Vous avez des modifications sur cette branche. Que voulez-vous en faire ?", padx=20).pack(fill=tk.X, pady=(16, 12))
+    box = tk.Frame(dlg, bg=BG, highlightthickness=1, highlightbackground=BORDER)
+    box.pack(fill=tk.X, padx=20)
+
+    def paint():
+        for k, (ws, dot, sub) in cards.items():
+            on = k == mode.get()
+            for w in ws:
+                w.config(bg=CARD if on else BG)
+            sub.config(fg=FG if on else MUTED)
+            dot.delete("all")
+            dot.create_oval(2, 2, 16, 16, outline=BLUE if on else MUTED, width=2)
+            if on:
+                dot.create_oval(6, 6, 12, 12, fill=FG, outline="")
+
+    def pick(key):
+        mode.set(key)
+        paint()
+
+    def card(key, title, text):
+        f = tk.Frame(box, bg=BG, cursor="hand2")
+        f.pack(fill=tk.X)
+        dot = tk.Canvas(f, width=18, height=18, bg=BG, highlightthickness=0)
+        dot.pack(side=tk.LEFT, anchor="n", padx=(14, 10), pady=15)
+        col = tk.Frame(f, bg=BG)
+        col.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=12)
+        a = label(col, text=title, font=FONT_B)
+        a.pack(fill=tk.X)
+        b = label(col, text=text, fg=MUTED, wraplength=430, justify=tk.LEFT)
+        b.pack(fill=tk.X, pady=(3, 0), padx=(0, 14))
+        ws = (f, dot, col, a, b)
+        for w in ws:
+            w.bind("<Button-1>", lambda e: pick(key))
+        cards[key] = (ws, dot, b)
+
+    card("leave", f"Laisser mes modifications sur {branch}", "Votre travail en cours sera mis de côté (stash) sur cette branche : vous le retrouverez en y revenant.")
+    tk.Frame(box, bg=BORDER, height=1).pack(fill=tk.X)
+    card("bring", f"Emporter mes modifications vers {name}", "Votre travail en cours vous suit sur la nouvelle branche.")
+    paint()
+    tk.Frame(dlg, bg=BORDER, height=1).pack(fill=tk.X, pady=(18, 0))
+    row = tk.Frame(dlg, bg=BG)
+    row.pack(fill=tk.X, padx=20, pady=14)
+
+    def ok():
+        out["v"] = mode.get()
+        dlg.destroy()
+    btn(row, "Changer de branche", ok, BLUE, "white", FONT_B, padx=18, pady=7).pack(side=tk.RIGHT, padx=(8, 0))
+    btn(row, "Annuler", dlg.destroy, padx=22, pady=7).pack(side=tk.RIGHT)
+    dlg.bind("<Return>", lambda e: ok())
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+    for k in ("<Up>", "<Down>"):
+        dlg.bind(k, lambda e: pick("bring" if mode.get() == "leave" else "leave"))
+    dlg.focus_set()
+    try:
+        dlg.wait_visibility()
+        dlg.grab_set()
+    except tk.TclError:
+        pass
+    root.wait_window(dlg)
+    return out["v"]
+
+
 root = tk.Tk()
 root.geometry("1280x840")
 root.minsize(1000, 660)
 root.configure(bg=BG)
 root.protocol("WM_DELETE_WINDOW", quit_app)
+root.bind("<Button-1>", DropBtn.outside, add="+")
 st = ttk.Style()
 st.theme_use("clam")
 st.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=FG, rowheight=26, borderwidth=0, font=FONT,
@@ -1810,9 +2147,9 @@ st.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonl
 for o, side in (("Vertical", "ns"), ("Horizontal", "ew")):  # barres fines, sans flèches
     st.layout(f"{o}.TScrollbar", [(f"{o}.Scrollbar.trough", {"sticky": side, "children": [
         (f"{o}.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
-    st.configure(f"{o}.TScrollbar", background=BORDER, troughcolor=PANEL, bordercolor=PANEL, lightcolor=BORDER,
-                 darkcolor=BORDER, arrowsize=10, relief="flat")
-    st.map(f"{o}.TScrollbar", background=[("active", "#4a525e")])
+    st.configure(f"{o}.TScrollbar", background=THUMB, troughcolor=PANEL, bordercolor=PANEL, lightcolor=THUMB,
+                 darkcolor=THUMB, arrowsize=10, relief="flat")
+    st.map(f"{o}.TScrollbar", background=[("active", "#586069")])
 st.configure("Horizontal.TProgressbar", troughcolor=BORDER, background=BLUE, bordercolor=BG, lightcolor=BLUE,
              darkcolor=BLUE, thickness=3)
 root.option_add("*TCombobox*Listbox.background", FIELD)
@@ -1840,31 +2177,30 @@ def box_img(kind):  # case à cocher façon GitHub Desktop : carré vide / bleu 
 
 IMG = {k: box_img(k) for k in ("off", "on", "mixed")}  # références gardées : sinon Tk les efface
 
-# barre du haut : dépôt · branche · synchro
+# barre du haut, comme GitHub Desktop : dépôt ▾ | branche ▾ | fetch / pull / push selon l'état
 tb = tk.Frame(root, bg=TOP, highlightthickness=1, highlightbackground=BORDER)
 tb.pack(fill=tk.X)
+combo = DropBtn(tb, "▤", "Dépôt courant", lambda i, v: set_repo(repos[i]), (("Ajouter…", pick), ("Retirer le dépôt courant de la liste", remove_repo)), 260)
+combo.pack(side=tk.LEFT)
+bcombo = DropBtn(tb, "⎇", "Branche courante", lambda i, v: switch_branch(v), (("Nouvelle branche", new_branch),), 260)
+bcombo.pack(side=tk.LEFT)
+tb_sync = ToolBtn(tb, "↻", "", "Fetch origin", lambda: SYNC["run"](), 230, small_first=False)
+tb_sync.pack(side=tk.LEFT)
+tb_fetch = btn(tb, "↻", lambda: sync("Fetch", "fetch", "--prune"), padx=9, pady=4)  # le fetch reste toujours accessible
+tb_fetch.pack(side=tk.LEFT, padx=(10, 0))
 
 
 def section(caption):
     f = tk.Frame(tb, bg=TOP)
-    f.pack(side=tk.LEFT, padx=(14, 0), pady=8)
-    label(f, text=caption.upper(), bg=TOP, fg=MUTED, font=SMALL_B).pack(fill=tk.X, pady=(0, 2))
+    f.pack(side=tk.RIGHT, padx=(0, 16), pady=6)
+    label(f, text=caption, bg=TOP, fg=MUTED, font=SMALL).pack(fill=tk.X, pady=(0, 1))
     r = tk.Frame(f, bg=TOP)
     r.pack()
     return r
 
 
-r1 = section("Dépôt")
-combo = ttk.Combobox(r1, state="readonly", font=FONT_B, width=26)
-combo.pack(side=tk.LEFT)
-combo.bind("<<ComboboxSelected>>", lambda e: set_repo(repos[combo.current()]))
-btn(r1, "＋", pick, padx=8, pady=3).pack(side=tk.LEFT, padx=(6, 0))
-btn(r1, "✕", remove_repo, padx=8, pady=3).pack(side=tk.LEFT, padx=(4, 0))
-r2 = section("Branche")
-bcombo = ttk.Combobox(r2, state="readonly", font=FONT_B, width=26)
-bcombo.pack(side=tk.LEFT)
-bcombo.bind("<<ComboboxSelected>>", switch_branch)
-btn(r2, "＋", new_branch, padx=8, pady=3).pack(side=tk.LEFT, padx=(6, 0))
+tb_mr = btn(tb, "⎇ Créer une MR", merge_dialog, PURPLE, "white", FONT_B, padx=12, pady=5)
+tb_mr.pack(side=tk.RIGHT, padx=(0, 14))
 r_u = section("Utilisateur")
 uav = tk.Label(r_u, bg=TOP)
 uav.pack(side=tk.LEFT, padx=(0, 6))
@@ -1874,16 +2210,6 @@ ucombo.bind("<<ComboboxSelected>>", switch_user)
 btn(r_u, "＋", lambda: profile_dialog(False), padx=8, pady=3).pack(side=tk.LEFT, padx=(6, 0))
 btn(r_u, "✎", lambda: profile_dialog(True), padx=8, pady=3).pack(side=tk.LEFT, padx=(4, 0))
 btn(r_u, "✕", delete_user, padx=8, pady=3).pack(side=tk.LEFT, padx=(4, 0))
-r3 = tk.Frame(tb, bg=TOP)
-r3.pack(side=tk.RIGHT, padx=14, pady=12)
-tb_push = btn(r3, "Push", lambda: sync("Push", "push", "-u", "origin", "HEAD"), padx=12, pady=5)
-tb_push.pack(side=tk.RIGHT, padx=(6, 0))
-tb_pull = btn(r3, "Pull", lambda: sync("Pull", "pull", "--ff-only"), padx=12, pady=5)
-tb_pull.pack(side=tk.RIGHT, padx=(6, 0))
-tb_fetch = btn(r3, "Fetch", lambda: sync("Fetch", "fetch", "--prune"), padx=12, pady=5)
-tb_fetch.pack(side=tk.RIGHT)
-tb_mr = btn(r3, "⎇ Créer une MR", merge_dialog, PURPLE, "white", FONT_B, padx=12, pady=5)
-tb_mr.pack(side=tk.RIGHT, padx=(0, 18))
 
 pw = tk.PanedWindow(root, orient=tk.HORIZONTAL, bg=BORDER, sashwidth=3, bd=0, sashrelief=tk.FLAT)
 pw.pack(fill=tk.BOTH, expand=True)
@@ -1955,6 +2281,12 @@ label(chg_frame, text="Case : clic · glisser · Maj+clic (plage) · Espace · C
       fg=MUTED, font=SMALL).pack(fill=tk.X, padx=14, pady=(3, 6))
 form = tk.Frame(chg_frame, bg=BG)
 form.pack(fill=tk.X, padx=12)
+stash_bar = tk.Frame(chg_frame, bg=CARD, highlightthickness=1, highlightbackground=BORDER)  # affiché seulement si la branche a un stash laissé par l'app
+stash_lbl = tk.Label(stash_bar, text="⧈  Modifications mises de côté", bg=CARD, fg=FG, font=FONT_B, anchor="w", cursor="hand2", padx=10, pady=8)
+stash_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+stash_lbl.bind("<Button-1>", lambda e: stash_view())
+btn(stash_bar, "Supprimer", lambda: stash_drop(), padx=10, pady=3).pack(side=tk.RIGHT, padx=(4, 8))
+btn(stash_bar, "Restaurer", lambda: stash_pop(), BLUE, "white", padx=10, pady=3).pack(side=tk.RIGHT)
 trow = tk.Frame(form, bg=BG)
 trow.pack(fill=tk.X)
 label(trow, text="Titre", fg=MUTED).pack(side=tk.LEFT)
@@ -2085,7 +2417,7 @@ for _t, _c in (("kw", "#ff7b72"), ("str", "#a5d6ff"), ("num", "#79c0ff"), ("typ"
     d.tag_configure(_t, foreground=_c)
 d.tag_configure("com", foreground="#8b949e", font=MONO_I)
 d.tag_configure("ln", foreground="#6e7681")  # créé en dernier : sa couleur l'emporte sur celle de add/del
-btns = [ai_btn, commit_btn, push_btn, tb_fetch, tb_pull, tb_push, tb_mr]
+btns = [ai_btn, commit_btn, push_btn, tb_fetch, tb_sync, tb_mr]
 
 try:
     with open(CONF, encoding="utf-8") as fh:
