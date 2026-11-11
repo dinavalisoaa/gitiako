@@ -1,4 +1,4 @@
-import base64, datetime, json, os, re, shutil, subprocess, sys, tempfile, threading, urllib.parse, webbrowser, tkinter as tk
+import base64, datetime, json, os, re, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, webbrowser, tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -494,8 +494,8 @@ def on_hfile(path):
 
 
 def tab(which):
-    frames = {"chg": chg_frame, "hist": hist_frame, "pipe": pipe_frame}
-    labels_ = {"chg": tab_chg, "hist": tab_hist, "pipe": tab_pipe}
+    frames = {"chg": chg_frame, "hist": hist_frame, "pipe": pipe_frame, "mr": mr_frame}
+    labels_ = {"chg": tab_chg, "hist": tab_hist, "pipe": tab_pipe, "mr": tab_mr}
     for k, f in frames.items():
         f.pack_forget()
         labels_[k].config(fg=FG if k == which else MUTED)
@@ -518,6 +518,11 @@ def tab(which):
             clist.set(0)  # le dernier commit s'ouvre tout seul
         else:
             show_diff("", "")
+    elif which == "mr":
+        if MRS["repo"] != repo:
+            refresh_mrs()
+        elif mtree.selection():
+            on_mr(None)
     elif PIPE["repo"] != repo:  # première ouverture, ou autre dépôt depuis la dernière fois
         refresh_pipes()
     elif jtree.selection():
@@ -527,18 +532,40 @@ def tab(which):
 
 
 # ---------- tâches de fond ----------
-def bg(job, then):
+def busy(var, label):  # « label… 1.3 s » rafraîchi pendant la tâche ; done(fn) fige « label · 1.3 s », lance fn, garde la durée si fn change le texte
+    t0, live = time.monotonic(), [True]
+
+    def tick():
+        if live[0]:
+            var.set(f"{label}… {time.monotonic() - t0:.1f} s")
+            root.after(100, tick)
+    tick()
+
+    def done(fn):
+        live[0] = False
+        d = f"{time.monotonic() - t0:.1f} s"
+        base = f"{label} · {d}"
+        var.set(base)
+        fn()
+        if var.get() != base:
+            var.set(f"{var.get()} · {d}")
+    return done
+
+
+def bg(job, then, label=None):  # label : nom de l'action ; à défaut, le texte « … » déjà posé dans la barre d'état
     for b in btns:
         b.config(state=tk.DISABLED)
     pb.place(relwidth=1, relheight=1)
     pb.start(12)
+    s = status.get()
+    done = busy(status, label or (s[:-1] if s.endswith("…") else "Chargement"))
 
     def t():
         try:
             r, err = job(), None
         except Exception as e:
             r, err = None, str(e)
-        root.after(0, lambda: fin(then, r, err))
+        root.after(0, lambda: done(lambda: fin(then, r, err)))
     threading.Thread(target=t, daemon=True).start()
 
 
@@ -662,13 +689,13 @@ def commit(push):
 def switch_branch(_=None):
     name = bcombo.get()
     if name and name != branch:
-        bg(lambda: git("checkout", name), lambda _: (load(), status.set(f"Branche : {name}")))
+        bg(lambda: git("checkout", name), lambda _: (load(), status.set(f"Branche : {name}")), f"Checkout {name}")
 
 
 def new_branch():
     name = (simpledialog.askstring("Nouvelle branche", f"Nom (créée depuis {branch}) :", parent=root) or "").strip()
     if name:
-        bg(lambda: git("checkout", "-b", name), lambda _: (load(), status.set(f"Branche créée : {name}")))
+        bg(lambda: git("checkout", "-b", name), lambda _: (load(), status.set(f"Branche créée : {name}")), f"Création de {name}")
 
 
 def sync(label, *args):
@@ -1140,13 +1167,15 @@ def fetch_log(j):  # fin du log, sans codes couleur
     return (f"… {cut} lignes plus haut\n" if cut > 0 else "") + "\n".join(lines[-LOG_LINES:])
 
 
-def bgq(job, then, fail):  # tâche de fond qui ne bloque pas les boutons : l'erreur va dans l'aperçu
+def bgq(job, then, fail, var=None, label="Chargement"):  # tâche de fond qui ne bloque pas les boutons : l'erreur va dans l'aperçu ; var : où afficher le temps écoulé
+    done = busy(var or status, label)
+
     def t():
         try:
             r, err = job(), None
         except Exception as e:
             r, err = None, str(e)
-        root.after(0, lambda: fail(err) if err else then(r))
+        root.after(0, lambda: done(lambda: fail(err) if err else then(r)))
     threading.Thread(target=t, daemon=True).start()
 
 
@@ -1192,7 +1221,7 @@ def refresh_pipes(*_):
         if tok == PIPE["tok"]:
             pipe_info.set("Indisponible")
             show_log(err, "Pipelines", note=True)
-    bgq(fetch_pipelines, ok, fail)
+    bgq(fetch_pipelines, ok, fail, pipe_info, "Chargement")
 
 
 def on_pipe(_):
@@ -1217,7 +1246,7 @@ def on_pipe(_):
             jtree.see(bad)
         else:
             show_log("Choisis un job pour voir son log." if jobs else "Aucun job.", f"Pipeline {p['id']} · {p['ref']}", note=True)
-    bgq(lambda: fetch_jobs(p), ok, lambda err: show_log(err, "Pipelines", note=True))
+    bgq(lambda: fetch_jobs(p), ok, lambda err: show_log(err, "Pipelines", note=True), label=f"Jobs du pipeline {p['id']}")
 
 
 def on_job(_):
@@ -1228,7 +1257,7 @@ def on_job(_):
     title = f"{j['name']} · {STATE.get(j['status'], ('', '', j['status']))[2]}"
     show_log("Chargement du log…", title, note=True)
     bgq(lambda: fetch_log(j), lambda t: tok == PIPE["tok"] and jtree.selection() == sel and show_log(t or "(log vide)", title),
-        lambda err: show_log(err, title, note=True))
+        lambda err: show_log(err, title, note=True), label=f"Log de {j['name']}")
 
 
 def set_token():  # saisie (ou remplacement) du token GitLab de l'hôte du dépôt courant
@@ -1237,7 +1266,7 @@ def set_token():  # saisie (ou remplacement) du token GitLab de l'hôte du dép�
     except RuntimeError as e:
         return status.set(str(e))
     if ask_token(host):
-        refresh_pipes()
+        (refresh_pipes if pipe_frame.winfo_ismapped() else refresh_mrs)()
 
 
 def open_web(which=None):  # "p"/"j" : le pipeline / le job choisi ; sinon (bouton) job, pipeline, puis page des pipelines du site
@@ -1255,6 +1284,68 @@ def open_web(which=None):  # "p"/"j" : le pipeline / le job choisi ; sinon (bout
     webbrowser.open(url)
 
 
+# ---------- merge requests créées par l'utilisateur actif (gh pour GitHub, glab ou API + token pour GitLab) ----------
+MRS = {"repo": None, "tok": 0, "rows": []}
+MR_STATE = {"opened": ("●", "run", "ouverte"), "open": ("●", "run", "ouverte"), "merged": ("✔", "ok", "mergée"),
+            "closed": ("⊘", "skip", "fermée"), "locked": ("◷", "wait", "verrouillée")}
+
+
+def fetch_mrs():
+    kind, cli = ci_tool()
+    if kind == "github":
+        rows = json.loads(run([cli, "pr", "list", "--author", "@me", "--state", "all", "-L", "50", "--json",
+                               "number,title,state,headRefName,baseRefName,createdAt,url"], cwd=repo, env=ci_env()))
+        return [dict(ref=f'#{r["number"]}', state=r["state"].lower(), title=r["title"], src=r["headRefName"], tgt=r["baseRefName"],
+                     when=r["createdAt"], url=r["url"]) for r in rows]
+    rows = json.loads(gl_get(cli, "projects/:id/merge_requests?scope=created_by_me&state=all&per_page=50"))
+    return [dict(ref=f'!{r["iid"]}', state=r["state"], title=r["title"], src=r["source_branch"], tgt=r["target_branch"],
+                 when=r["created_at"], url=r["web_url"]) for r in rows]
+
+
+def refresh_mrs(*_):
+    if not repo:
+        return
+    MRS["tok"] += 1
+    tok, MRS["repo"] = MRS["tok"], repo
+    MRS["rows"] = []
+    mtree.delete(*mtree.get_children())
+    mr_info.set("Chargement…")
+
+    def ok(rows):
+        if tok != MRS["tok"]:
+            return
+        MRS["rows"] = rows
+        for i, r in enumerate(rows):
+            sym, tag, _ = MR_STATE.get(r["state"], ("?", "wait", r["state"]))
+            mtree.insert("", tk.END, iid=str(i), values=(sym, f'{r["ref"]} · {r["title"]}', f'{r["src"]} → {r["tgt"]}', ago(r["when"])), tags=(tag,))
+        mr_info.set(f"{len(rows)} MR" if rows else "Aucune MR")
+        if rows:
+            mtree.selection_set("0")
+        else:
+            show_log("Aucune merge request créée par toi sur ce dépôt.", "Merge requests", note=True)
+
+    def fail(err):
+        if tok == MRS["tok"]:
+            mr_info.set("Indisponible")
+            show_log(err, "Merge requests", note=True)
+    bgq(fetch_mrs, ok, fail, mr_info, "Chargement")
+
+
+def on_mr(_):
+    sel = mtree.selection()
+    if not sel or not MRS["rows"]:
+        return
+    r = MRS["rows"][int(sel[0])]
+    show_log(f'{r["title"]}\n\n{r["src"]} → {r["tgt"]}\nÉtat : {MR_STATE.get(r["state"], ("", "", r["state"]))[2]}\nCréée {ago(r["when"])}\n{r["url"]}',
+             f'{r["ref"]} · {r["title"]}', note=True)
+
+
+def open_mr(_=None):
+    sel = mtree.selection()
+    if sel and MRS["rows"]:
+        webbrowser.open(MRS["rows"][int(sel[0])]["url"])
+
+
 # ---------- utilisateurs (profils) ----------
 def refresh_users():
     names_ = [x["name"] for x in PROFILES["list"]]
@@ -1270,9 +1361,11 @@ def switch_user(_=None):
     PROFILES["active"] = PROFILES["list"][ucombo.current()]["id"]
     save_profiles()
     refresh_users()
-    PIPE["repo"] = None  # les pipelines se rechargent avec le token du nouvel utilisateur
+    PIPE["repo"] = MRS["repo"] = None  # pipelines et MR se rechargent avec le token du nouvel utilisateur
     if pipe_frame.winfo_ismapped():
         refresh_pipes()
+    elif mr_frame.winfo_ismapped():
+        refresh_mrs()
     status.set(f"Utilisateur : {me()['name']}")
 
 
@@ -1401,6 +1494,8 @@ def set_repo(d_):
     load()
     if pipe_frame.winfo_ismapped():  # l'onglet Pipelines est ouvert : il suit le dépôt
         refresh_pipes()
+    elif mr_frame.winfo_ismapped():
+        refresh_mrs()
 
 
 def pick():
@@ -1452,14 +1547,21 @@ class RBtn(tk.Canvas):  # bouton à coins arrondis ; mêmes options config(text/
         self.bind("<Configure>", lambda e: self.draw())
         self.bind("<Enter>", lambda e: self.hover(True))
         self.bind("<Leave>", lambda e: self.hover(False))
+        self.down = False  # feedback immédiat au clic : le bouton s'éclaircit et le texte descend d'un pixel
+        self.bind("<ButtonPress-1>", lambda e: self.press(True))
         self.bind("<ButtonRelease-1>", self.click)
         self.config(text=text)
+
+    def press(self, v):
+        self.down = v and self.on
+        self.draw()
 
     def hover(self, v):
         self.hov = v
         self.draw()
 
     def click(self, e):
+        self.press(False)
         if self.on and 0 <= e.x <= self.winfo_width() and 0 <= e.y <= self.winfo_height():
             self.cmd()
 
@@ -1484,8 +1586,8 @@ class RBtn(tk.Canvas):  # bouton à coins arrondis ; mêmes options config(text/
         x1, y1, x2, y2 = 1, 1, w - 1, h - 1
         pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2, x1, y2,
                x1, y2 - r, x1, y1 + r, x1, y1]
-        self.create_polygon(pts, smooth=True, outline="", fill=lighten(self.color) if self.hov and self.on else self.color)
-        self.create_text(w // 2, h // 2, text=self.text, fill=self.fg if self.on else MUTED, font=self.fnt)
+        self.create_polygon(pts, smooth=True, outline="", fill=lighten(lighten(self.color)) if self.down else lighten(self.color) if self.hov and self.on else self.color)
+        self.create_text(w // 2, h // 2 + self.down, text=self.text, fill=self.fg if self.on else MUTED, font=self.fnt)
 
 
 def btn(parent, text, cmd, color=GREY, fg=FG, font=FONT, **kw):
@@ -1810,7 +1912,7 @@ def make_tab(which, text):  # onglet à plat avec filet bleu sous l'actif, comme
     return lab
 
 
-tab_chg, tab_hist, tab_pipe = make_tab("chg", "Changements"), make_tab("hist", "Historique"), make_tab("pipe", "Pipelines")
+tab_chg, tab_hist, tab_pipe, tab_mr = make_tab("chg", "Changements"), make_tab("hist", "Historique"), make_tab("pipe", "Pipelines"), make_tab("mr", "MR")
 
 # --- onglet Changements
 chg_frame = tk.Frame(left, bg=BG)
@@ -1908,6 +2010,25 @@ ptree.bind("<Double-Button-1>", lambda e: open_web("p"))
 jtree.bind("<Double-Button-1>", lambda e: open_web("j"))
 ptree.bind("<<TreeviewSelect>>", on_pipe)
 jtree.bind("<<TreeviewSelect>>", on_job)
+
+# --- onglet MR : les merge requests créées par l'utilisateur actif ; le détail s'affiche à droite
+mr_frame = tk.Frame(left, bg=BG)
+mr_info = tk.StringVar()
+mrow = tk.Frame(mr_frame, bg=BG)
+mrow.pack(fill=tk.X, padx=12, pady=(0, 6))
+btn(mrow, "Actualiser", refresh_mrs, padx=10, pady=2).pack(side=tk.LEFT)
+btn(mrow, "Ouvrir ↗", open_mr, padx=10, pady=2).pack(side=tk.LEFT, padx=4)
+btn(mrow, "Token…", lambda: set_token(), padx=10, pady=2).pack(side=tk.LEFT)
+label(mrow, textvariable=mr_info, fg=MUTED).pack(side=tk.RIGHT)
+mbox, mtree = make_tree(mr_frame, ("st", "title", "br", "when"), selectmode="browse")
+mbox.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+for c, text, w, stretch in (("st", "", 34, False), ("title", "Merge request", 200, True), ("br", "Branches", 170, False), ("when", "Date", 90, False)):
+    mtree.heading(c, text=text, anchor="w")
+    mtree.column(c, width=w, stretch=stretch, anchor="center" if c == "st" else "w")
+for tag, color in (("ok", "#56d364"), ("run", BLUE), ("wait", AMBER), ("skip", MUTED)):
+    mtree.tag_configure(tag, foreground=color)
+mtree.bind("<Double-Button-1>", open_mr)
+mtree.bind("<<TreeviewSelect>>", on_mr)
 
 # --- volet droit : aperçu du diff
 hhead = tk.Frame(right, bg=TOP, highlightthickness=1, highlightbackground=BORDER)  # en-tête du commit : affiché dans Historique seulement
